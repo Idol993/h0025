@@ -45,10 +45,12 @@ def test_1_unmet_demand_detection():
 
     print(f"  消息: {result.message}")
     print(f"  成功: {result.success}")
+    print(f"  状态: {result.status.value}")
     print(f"  总缺口数: {len(result.unmet_demands)}")
     for u in result.unmet_demands:
         print(f"  📌 {u.weekday.name}/{u.slot.value} 岗位[{u.position}] 需{u.required_count}人 排了{u.assigned_count}人 缺口{u.gap}人 → {u.reason}")
-    assert result.success, f"求解失败：{result.message}"
+    assert result.status.value == "partial_success", f"应为部分成功，实际{result.status.value}"
+    assert result.success is False, "有缺口时success应为False"
     assert len(result.unmet_demands) >= 2, "应至少检测到2个缺口"
     print("  ✅ PASS\n")
 

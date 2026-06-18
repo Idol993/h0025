@@ -578,23 +578,33 @@ def generate_schedule(req: ScheduleGenerateRequest, db: Session = Depends(get_db
     optimizer = ShiftOptimizer(time_limit_seconds=req.time_limit_seconds)
     result = optimizer.optimize(optimizer_emps, optimizer_demands, req.week_start, history_weekend)
 
-    if result.success and req.write_to_db:
-        db.query(DBShift).filter(
-            DBShift.week_start == req.week_start,
-            (DBShift.store_id == req.store_id) if req.store_id else True,
-        ).delete(synchronize_session=False)
-        for s in result.shifts:
-            emp = db.query(DBEmployee).filter(DBEmployee.id == s.employee_id).first()
-            store = emp.store_id if emp else req.store_id
-            db_shift = DBShift(
-                employee_id=s.employee_id, date=s.date,
-                start_time=s.start_time, end_time=s.end_time,
-                slot=s.slot.value, position=s.position,
-                hours=s.hours, cost=s.cost, week_start=req.week_start,
-                store_id=store,
-            )
-            db.add(db_shift)
-        db.commit()
+    written_to_db = False
+    if req.write_to_db:
+        if result.status.value == "full_success":
+            db.query(DBShift).filter(
+                DBShift.week_start == req.week_start,
+                (DBShift.store_id == req.store_id) if req.store_id else True,
+            ).delete(synchronize_session=False)
+            for s in result.shifts:
+                emp = db.query(DBEmployee).filter(DBEmployee.id == s.employee_id).first()
+                store = emp.store_id if emp else req.store_id
+                db_shift = DBShift(
+                    employee_id=s.employee_id, date=s.date,
+                    start_time=s.start_time, end_time=s.end_time,
+                    slot=s.slot.value, position=s.position,
+                    hours=s.hours, cost=s.cost, week_start=req.week_start,
+                    store_id=store,
+                )
+                db.add(db_shift)
+            db.commit()
+            written_to_db = True
+        else:
+            msg_extra = ""
+            if result.status.value == "partial_success":
+                msg_extra = f"存在{len(result.unmet_demands)}项人力缺口"
+            elif result.status.value == "failed":
+                msg_extra = "排班完全失败"
+            result.message = f"{result.message}（已跳过写入正式班表：{msg_extra}，请先处理缺口后再写入）"
 
     return result
 
