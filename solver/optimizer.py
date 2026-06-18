@@ -25,6 +25,12 @@ class ShiftSlot(str, Enum):
     NIGHT = "night"
 
 
+class ScheduleStatus(str, Enum):
+    FULL_SUCCESS = "full_success"
+    PARTIAL_SUCCESS = "partial_success"
+    FAILED = "failed"
+
+
 SLOT_TIME_RANGES: Dict[ShiftSlot, Tuple[Time, Time]] = {
     ShiftSlot.MORNING: (Time(8, 0), Time(16, 0)),
     ShiftSlot.MIDDAY: (Time(10, 0), Time(18, 0)),
@@ -114,14 +120,32 @@ class UnmetDemand(BaseModel):
     reason: str = ""
 
 
+class RemedyItem(BaseModel):
+    category: str
+    position: str = ""
+    weekday: Weekday | None = None
+    slot: ShiftSlot | None = None
+    gap: int = 0
+    suggested_employees: List[str] = Field(default_factory=list)
+    description: str = ""
+
+
+class RemedySuggestion(BaseModel):
+    temp_worker_count: int = 0
+    items: List[RemedyItem] = Field(default_factory=list)
+    summary: str = ""
+
+
 class OptimizationResult(BaseModel):
     success: bool
+    status: ScheduleStatus
     converged: bool
     message: str
     total_cost: float
     total_hours: float
     shifts: List[ScheduledShift] = Field(default_factory=list)
     unmet_demands: List[UnmetDemand] = Field(default_factory=list)
+    remedy_suggestion: RemedySuggestion | None = None
     solve_time_seconds: float = 0.0
 
 
@@ -258,6 +282,93 @@ class ShiftOptimizer:
                 reason=reason,
             ))
         return result
+
+    def _generate_remedy_suggestions(
+        self,
+        unmet_demands: List[UnmetDemand],
+        demands: List[ShiftDemand],
+        employees: List[Employee],
+    ) -> RemedySuggestion:
+        items: List[RemedyItem] = []
+        total_temp_needed = 0
+
+        for ud in unmet_demands:
+            gap = ud.gap
+            if gap <= 0:
+                continue
+
+            candidates_available_fix: List[str] = []
+            candidates_skill_fix: List[str] = []
+            candidates_position_fix: List[str] = []
+
+            for emp in employees:
+                position_match = emp.position == ud.position or not ud.position
+                skill_match = self._employee_has_skills(emp, ud.required_skills) if ud.required_skills else True
+                available = emp.is_available(ud.weekday, ud.slot)
+                minor_night_ok = not (emp.is_minor and self._is_night_shift(ud.slot))
+
+                if position_match and skill_match and not available and minor_night_ok:
+                    candidates_available_fix.append(f"{emp.name}({emp.id})")
+                elif position_match and not skill_match and available and minor_night_ok:
+                    missing = [s for s in ud.required_skills if s not in emp.skills]
+                    candidates_skill_fix.append(f"{emp.name}({emp.id})缺{','.join(missing)}")
+                elif not position_match and skill_match and available and minor_night_ok:
+                    candidates_position_fix.append(f"{emp.name}({emp.id})-{emp.position}")
+
+            if candidates_available_fix:
+                items.append(RemedyItem(
+                    category="adjust_availability",
+                    position=ud.position,
+                    weekday=ud.weekday,
+                    slot=ud.slot,
+                    gap=gap,
+                    suggested_employees=candidates_available_fix[:5],
+                    description=f"{ud.weekday_name}{ud.slot_name} {ud.position} 有{len(candidates_available_fix)}人岗位技能都符合，只需调整可用时间就能补上缺口",
+                ))
+            elif candidates_skill_fix:
+                items.append(RemedyItem(
+                    category="skill_gap",
+                    position=ud.position,
+                    weekday=ud.weekday,
+                    slot=ud.slot,
+                    gap=gap,
+                    suggested_employees=candidates_skill_fix[:5],
+                    description=f"{ud.weekday_name}{ud.slot_name} {ud.position} 有{len(candidates_skill_fix)}人岗位符合但缺技能，可培训或临时授权",
+                ))
+            elif candidates_position_fix:
+                items.append(RemedyItem(
+                    category="position_mismatch",
+                    position=ud.position,
+                    weekday=ud.weekday,
+                    slot=ud.slot,
+                    gap=gap,
+                    suggested_employees=candidates_position_fix[:5],
+                    description=f"{ud.weekday_name}{ud.slot_name} {ud.position} 有{len(candidates_position_fix)}人技能符合但岗位不同，可跨岗支援",
+                ))
+            else:
+                total_temp_needed += gap
+                items.append(RemedyItem(
+                    category="temp_worker",
+                    position=ud.position,
+                    weekday=ud.weekday,
+                    slot=ud.slot,
+                    gap=gap,
+                    suggested_employees=[],
+                    description=f"{ud.weekday_name}{ud.slot_name} {ud.position} 无合适内部员工，建议招{gap}名临时工",
+                ))
+
+        if total_temp_needed > 0:
+            summary = f"共需{total_temp_needed}名临时工补充缺口，另有{len(items) - total_temp_needed}项可通过内部调整解决"
+        elif items:
+            summary = f"全部{len(items)}项缺口均可通过内部调整（可用时间/技能培训/跨岗支援）解决"
+        else:
+            summary = "无缺口，排班完美满足"
+
+        return RemedySuggestion(
+            temp_worker_count=total_temp_needed,
+            items=items,
+            summary=summary,
+        )
 
     def optimize(
         self,
