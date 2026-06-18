@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import io
 import json
 import os
 import sys
 import tempfile
-from datetime import date, datetime, time, timedelta
+from datetime import date as PyDate, datetime as PyDateTime, time as PyTime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -82,7 +80,7 @@ class DBStore(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     address: Mapped[Optional[str]] = mapped_column(String(256))
-    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+    created_at: Mapped[PyDateTime] = mapped_column(default=PyDateTime.now)
 
 
 class DBEmployee(Base):
@@ -96,7 +94,7 @@ class DBEmployee(Base):
     is_minor: Mapped[bool] = mapped_column(Boolean, default=False)
     feedback_weight: Mapped[float] = mapped_column(Float, default=1.0)
     store_id: Mapped[Optional[str]] = mapped_column(String(64), ForeignKey("stores.id"))
-    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+    created_at: Mapped[PyDateTime] = mapped_column(default=PyDateTime.now)
     availabilities: Mapped[List["DBAvailability"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
     shifts: Mapped[List["DBShift"]] = relationship(back_populates="employee")
     feedbacks: Mapped[List["DBFeedback"]] = relationship(back_populates="employee", cascade="all, delete-orphan")
@@ -118,16 +116,16 @@ class DBShift(Base):
     __tablename__ = "shifts"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     employee_id: Mapped[str] = mapped_column(String(64), ForeignKey("employees.id"), nullable=False)
-    date: Mapped[date] = mapped_column(Date, nullable=False)
-    start_time: Mapped[time] = mapped_column(Time, nullable=False)
-    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    date: Mapped[PyDate] = mapped_column(Date, nullable=False)
+    start_time: Mapped[PyTime] = mapped_column(Time, nullable=False)
+    end_time: Mapped[PyTime] = mapped_column(Time, nullable=False)
     slot: Mapped[str] = mapped_column(String(32), nullable=False)
     position: Mapped[str] = mapped_column(String(64))
     hours: Mapped[float] = mapped_column(Float, nullable=False)
     cost: Mapped[float] = mapped_column(Float, nullable=False)
-    week_start: Mapped[date] = mapped_column(Date, nullable=False)
+    week_start: Mapped[PyDate] = mapped_column(Date, nullable=False)
     store_id: Mapped[Optional[str]] = mapped_column(String(64), ForeignKey("stores.id"))
-    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+    created_at: Mapped[PyDateTime] = mapped_column(default=PyDateTime.now)
     employee: Mapped[DBEmployee] = relationship(back_populates="shifts")
 
 
@@ -135,14 +133,51 @@ class DBFeedback(Base):
     __tablename__ = "feedback"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     employee_id: Mapped[str] = mapped_column(String(64), ForeignKey("employees.id"), nullable=False)
-    week_start: Mapped[date] = mapped_column(Date, nullable=False)
+    week_start: Mapped[PyDate] = mapped_column(Date, nullable=False)
     rating: Mapped[str] = mapped_column(String(32), nullable=False)
     comment: Mapped[Optional[str]] = mapped_column(String(512))
-    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+    created_at: Mapped[PyDateTime] = mapped_column(default=PyDateTime.now)
     employee: Mapped[DBEmployee] = relationship(back_populates="feedbacks")
 
 
 Base.metadata.create_all(bind=engine)
+
+
+_FALSE_VALUES = {
+    "0", "false", "no", "n", "否", "不可用", "不行", "不能", "没有", "无",
+    "假", "休息", "休息中", "请假", "休假", "不", "✗", "×", "x", "禁用",
+    "不可", "不可以", "不上班", "下班", "不排",
+}
+_TRUE_VALUES = {
+    "1", "true", "yes", "y", "是", "可用", "行", "可以", "有",
+    "真", "上班", "工作", "在", "排", "可", "✓", "√", "✔", "启用",
+    "能够", "能", "正常", "在岗", "可以上",
+}
+
+
+def smart_parse_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+        return bool(value)
+    s = str(value).strip().lower()
+    if not s:
+        return default
+    if s in _FALSE_VALUES:
+        return False
+    if s in _TRUE_VALUES:
+        return True
+    if s.startswith("不") or s.endswith("不可") or s.endswith("不能") or s.endswith("不可以"):
+        return False
+    if s.startswith("可") or s.startswith("能"):
+        return True
+    return default
 
 
 def get_db():
@@ -170,12 +205,12 @@ app.add_middleware(
 
 class HealthResponse(BaseModel):
     status: str
-    timestamp: datetime
+    timestamp: PyDateTime
 
 
 @app.get("/api/health", response_model=HealthResponse)
 def health_check():
-    return HealthResponse(status="ok", timestamp=datetime.now())
+    return HealthResponse(status="ok", timestamp=PyDateTime.now())
 
 
 class StoreCreate(BaseModel):
@@ -188,7 +223,7 @@ class StoreResponse(BaseModel):
     id: str
     name: str
     address: Optional[str] = None
-    created_at: datetime
+    created_at: PyDateTime
 
 
 @app.post("/api/stores", response_model=StoreResponse)
@@ -236,7 +271,7 @@ class EmployeeResponse(BaseModel):
     is_minor: bool
     feedback_weight: float
     store_id: Optional[str] = None
-    created_at: datetime
+    created_at: PyDateTime
     availabilities: List[dict] = Field(default_factory=list)
 
 
@@ -407,8 +442,8 @@ async def import_employees_from_excel(
                 av_entry = {
                     "weekday": wd_int,
                     "slot": slot_val,
-                    "available": bool(row.get("可用", row.get("available", True))),
-                    "preferred": bool(row.get("偏好", row.get("preferred", False))),
+                    "available": smart_parse_bool(row.get("可用", row.get("available", None)), default=True),
+                    "preferred": smart_parse_bool(row.get("偏好", row.get("preferred", None)), default=False),
                 }
                 av_by_emp.setdefault(eid, []).append(av_entry)
             except Exception:
@@ -428,7 +463,7 @@ async def import_employees_from_excel(
             max_hours = int(row.get("最大周工时", row.get("max_weekly_hours", 60)))
             skills_raw = str(row.get("技能", row.get("skills", ""))).strip()
             skills = [s.strip() for s in skills_raw.replace("，", ",").split(",") if s.strip()] if skills_raw else []
-            is_minor = bool(row.get("未成年", row.get("is_minor", False)))
+            is_minor = smart_parse_bool(row.get("未成年", row.get("is_minor", None)), default=False)
 
             existing = db.query(DBEmployee).filter(DBEmployee.id == eid).first()
             if existing:
@@ -487,7 +522,7 @@ class ShiftDemandItem(BaseModel):
 
 
 class ScheduleGenerateRequest(BaseModel):
-    week_start: date
+    week_start: PyDate
     store_id: Optional[str] = None
     demands: List[ShiftDemandItem] = Field(default_factory=list)
     employee_ids: Optional[List[str]] = None
@@ -496,7 +531,7 @@ class ScheduleGenerateRequest(BaseModel):
 
     @field_validator("week_start")
     @classmethod
-    def check_monday(cls, v: date) -> date:
+    def check_monday(cls, v: PyDate) -> PyDate:
         if v.weekday() != 0:
             raise ValueError("week_start必须是周一")
         return v
@@ -568,20 +603,20 @@ class ShiftResponse(BaseModel):
     id: Optional[int] = None
     employee_id: str
     employee_name: str
-    date: date
-    start_time: time
-    end_time: time
+    date: PyDate
+    start_time: PyTime
+    end_time: PyTime
     slot: ShiftSlot
     position: str
     hours: float
     cost: float
-    week_start: date
+    week_start: PyDate
     store_id: Optional[str] = None
 
 
 @app.get("/api/schedule/shifts", response_model=List[ShiftResponse])
 def list_shifts(
-    week_start: Optional[date] = None,
+    week_start: Optional[PyDate] = None,
     store_id: Optional[str] = None,
     employee_id: Optional[str] = None,
     db: Session = Depends(get_db),
@@ -606,9 +641,31 @@ def list_shifts(
     return result
 
 
+def _collect_history_weekend_dates(
+    db: Session,
+    current_week_start: Optional[PyDate],
+    emp_ids: List[str],
+    lookback_weeks: int = 8,
+) -> Dict[str, List[PyDate]]:
+    result: Dict[str, List[PyDate]] = {}
+    if not current_week_start or not emp_ids:
+        return result
+    start = current_week_start - timedelta(weeks=lookback_weeks)
+    end = current_week_start - timedelta(days=1)
+    rows = db.query(DBShift.employee_id, DBShift.date).filter(
+        DBShift.employee_id.in_(emp_ids),
+        DBShift.date >= start,
+        DBShift.date <= end,
+        func.strftime("%w", DBShift.date).in_(["0", "6"]),
+    ).all()
+    for eid, d in rows:
+        result.setdefault(eid, []).append(d)
+    return result
+
+
 @app.get("/api/schedule/validate")
 def validate_schedule(
-    week_start: Optional[date] = Query(None),
+    week_start: Optional[PyDate] = Query(None),
     store_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -637,15 +694,16 @@ def validate_schedule(
         ))
         emps_map[s.employee_id] = db_emp
 
+    hist_weekends = _collect_history_weekend_dates(db, week_start, list(emps_map.keys()))
     optimizer_emps = [_to_optimizer_employee(e) for e in emps_map.values()]
     validator = ShiftValidator(optimizer_emps)
-    report = validator.validate(shifts, week_start=week_start)
+    report = validator.validate(shifts, week_start=week_start, history_weekend_dates=hist_weekends)
     return JSONResponse(json.loads(report.model_dump_json()))
 
 
 @app.get("/api/schedule/validate/report.pdf")
 def download_validation_report_pdf(
-    week_start: Optional[date] = Query(None),
+    week_start: Optional[PyDate] = Query(None),
     store_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -666,9 +724,10 @@ def download_validation_report_pdf(
         ))
         emps_map[s.employee_id] = db_emp
 
+    hist_weekends = _collect_history_weekend_dates(db, week_start, list(emps_map.keys()))
     optimizer_emps = [_to_optimizer_employee(e) for e in emps_map.values()]
     validator = ShiftValidator(optimizer_emps)
-    report = validator.validate(shifts, week_start=week_start)
+    report = validator.validate(shifts, week_start=week_start, history_weekend_dates=hist_weekends)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.close()
@@ -682,7 +741,7 @@ def download_validation_report_pdf(
 
 class FeedbackCreate(BaseModel):
     employee_id: str
-    week_start: date
+    week_start: PyDate
     rating: FeedbackRating
     comment: Optional[str] = None
 
@@ -708,7 +767,7 @@ def submit_feedback(fb: FeedbackCreate, db: Session = Depends(get_db)):
 @app.get("/api/reports/cost")
 def cost_report(
     period: str = Query("week", pattern="^(week|month)$"),
-    start_date: date = Query(...),
+    start_date: PyDate = Query(...),
     store_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -788,7 +847,7 @@ def cost_report(
 @app.get("/api/reports/cost/export")
 def export_cost_report(
     period: str = Query("week", pattern="^(week|month)$"),
-    start_date: date = Query(...),
+    start_date: PyDate = Query(...),
     store_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):

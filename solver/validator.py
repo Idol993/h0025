@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 import io
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date as Date, datetime as DateTime, time as Time, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -31,9 +29,10 @@ class Violation(BaseModel):
     message: str
     employee_id: Optional[str] = None
     employee_name: Optional[str] = None
-    shift_date: Optional[date] = None
+    shift_date: Optional[Date] = None
     shift_index: Optional[int] = None
     suggestion: str = ""
+    details: Dict = Field(default_factory=dict)
 
 
 class ValidationReport(BaseModel):
@@ -45,7 +44,7 @@ class ValidationReport(BaseModel):
     info_count: int = 0
     violations: List[Violation] = Field(default_factory=list)
     summary: Dict[str, int] = Field(default_factory=dict)
-    generated_at: datetime = Field(default_factory=datetime.now)
+    generated_at: DateTime = Field(default_factory=lambda: DateTime.now())
 
     def to_markdown(self) -> str:
         lines = ["# 排班合规检查报告\n"]
@@ -71,6 +70,9 @@ class ValidationReport(BaseModel):
                     line_parts.append(f"| 日期: {v.shift_date}")
                 if v.shift_index is not None:
                     line_parts.append(f"| 行号: #{v.shift_index + 1}")
+                if "weekends" in v.details and v.details["weekends"]:
+                    wknds = ", ".join(f"{d[0].month}/{d[0].day}-{d[1].month}/{d[1].day}" for d in v.details["weekends"])
+                    line_parts.append(f"| 涉及周末: [{wknds}]")
                 lines.append(" ".join(line_parts))
                 if v.suggestion:
                     lines.append(f"  - 建议修正: {v.suggestion}")
@@ -86,9 +88,10 @@ class ShiftValidator:
     LEGAL_MAX_DAILY_HOURS = 11
     WARNING_DAILY_HOURS = 10
     LEGAL_MAX_CONSECUTIVE_DAYS = 6
-    WARN_CONSECUTIVE_WEEKENDS = 3
-    NIGHT_SHIFT_START = time(22, 0)
-    NIGHT_SHIFT_END = time(6, 0)
+    WARN_CONSECUTIVE_DAYS = 6
+    WARN_CONSECUTIVE_WEEKENDS = 4
+    NIGHT_SHIFT_START = Time(22, 0)
+    NIGHT_SHIFT_END = Time(6, 0)
     MINOR_MAX_DAILY_HOURS = 8
     MINOR_ALLOWED_END_HOUR = 22
 
@@ -103,37 +106,89 @@ class ShiftValidator:
     def _get_employee(self, emp_id: str) -> Optional[Employee]:
         return self._emp_map.get(emp_id)
 
-    def _get_weekday(self, d: date) -> Weekday:
+    def _get_weekday(self, d: Date) -> Weekday:
         return Weekday(d.weekday())
 
-    def _is_weekend(self, d: date) -> bool:
+    def _is_weekend(self, d: Date) -> bool:
         return self._get_weekday(d) in (Weekday.SATURDAY, Weekday.SUNDAY)
 
-    def _is_night_time(self, t: time) -> bool:
+    def _is_night_time(self, t: Time) -> bool:
         return t >= self.NIGHT_SHIFT_START or t <= self.NIGHT_SHIFT_END
 
-    def _shift_hours(self, start: time, end: time) -> float:
-        today = date.today()
-        s_dt = datetime.combine(today, start)
-        e_dt = datetime.combine(today, end)
+    def _shift_hours(self, start: Time, end: Time) -> float:
+        today = Date.today()
+        s_dt = DateTime.combine(today, start)
+        e_dt = DateTime.combine(today, end)
         if e_dt <= s_dt:
             e_dt += timedelta(days=1)
         return (e_dt - s_dt).total_seconds() / 3600.0
 
+    def _get_weekend_range(self, any_date_in_week: Date) -> Tuple[Date, Date]:
+        monday = any_date_in_week - timedelta(days=any_date_in_week.weekday())
+        saturday = monday + timedelta(days=5)
+        sunday = monday + timedelta(days=6)
+        return (saturday, sunday)
+
+    def _find_consecutive_weekends(
+        self,
+        work_dates: List[Date],
+        week_start: Optional[Date],
+        extra_history_weekends: Optional[List[Date]] = None,
+    ) -> List[Tuple[Date, Date]]:
+        weekend_week_keys: set = set()
+        all_weekends_worked: Dict[str, Tuple[Date, Date]] = {}
+
+        dates_to_check = list(work_dates)
+        if extra_history_weekends:
+            dates_to_check.extend(extra_history_weekends)
+
+        for d in dates_to_check:
+            if self._is_weekend(d):
+                sat, sun = self._get_weekend_range(d)
+                key = f"{sat.isoformat()}"
+                weekend_week_keys.add(key)
+                all_weekends_worked[key] = (sat, sun)
+
+        if not weekend_week_keys:
+            return []
+
+        sorted_keys = sorted(weekend_week_keys)
+        runs: List[List[str]] = []
+        current_run = [sorted_keys[0]]
+        for i in range(1, len(sorted_keys)):
+            prev_key = sorted_keys[i - 1]
+            curr_key = sorted_keys[i]
+            prev_sat = Date.fromisoformat(prev_key)
+            curr_sat = Date.fromisoformat(curr_key)
+            if (curr_sat - prev_sat).days == 7:
+                current_run.append(curr_key)
+            else:
+                if len(current_run) >= self.WARN_CONSECUTIVE_WEEKENDS:
+                    runs.append(current_run)
+                current_run = [curr_key]
+        if len(current_run) >= self.WARN_CONSECUTIVE_WEEKENDS:
+            runs.append(current_run)
+
+        result = []
+        for run in runs:
+            for key in run:
+                result.append(all_weekends_worked[key])
+        return result
+
     def validate(
         self,
         shifts: List[ScheduledShift],
-        week_start: Optional[date] = None,
+        week_start: Optional[Date] = None,
+        history_weekend_dates: Optional[Dict[str, List[Date]]] = None,
     ) -> ValidationReport:
+        history_weekend_dates = history_weekend_dates or {}
         violations: List[Violation] = []
         shifts_sorted = sorted(shifts, key=lambda s: (s.date, s.employee_id))
 
         per_emp_hours_weekly: Dict[str, float] = {}
-        per_emp_hours_daily: Dict[Tuple[str, date], float] = {}
+        per_emp_hours_daily: Dict[Tuple[str, Date], float] = {}
         per_emp_work_dates: Dict[str, set] = {}
         per_emp_weekend_count: Dict[str, int] = {}
-        per_emp_consecutive_streak: Dict[str, int] = {}
-        per_emp_last_work_date: Dict[str, date] = {}
 
         for idx, shift in enumerate(shifts_sorted):
             emp_id = shift.employee_id
@@ -141,7 +196,6 @@ class ShiftValidator:
             shift_hours = self._shift_hours(shift.start_time, shift.end_time)
 
             per_emp_hours_weekly[emp_id] = per_emp_hours_weekly.get(emp_id, 0.0) + shift_hours
-
             day_key = (emp_id, shift.date)
             per_emp_hours_daily[day_key] = per_emp_hours_daily.get(day_key, 0.0) + shift_hours
 
@@ -277,30 +331,66 @@ class ShiftValidator:
             sorted_dates = sorted(dates)
             max_streak = 1
             current_streak = 1
+            streak_start = sorted_dates[0]
+            current_start = sorted_dates[0]
+            worst_start = sorted_dates[0]
+
             for i in range(1, len(sorted_dates)):
-                if (sorted_dates[i] - sorted_dates[i-1]).days == 1:
+                if (sorted_dates[i] - sorted_dates[i - 1]).days == 1:
                     current_streak += 1
-                    max_streak = max(max_streak, current_streak)
+                    if current_streak > max_streak:
+                        max_streak = current_streak
+                        worst_start = current_start
                 else:
                     current_streak = 1
+                    current_start = sorted_dates[i]
+
+            worst_end = worst_start + timedelta(days=max_streak - 1)
 
             if max_streak > self.LEGAL_MAX_CONSECUTIVE_DAYS:
                 violations.append(Violation(
                     severity=Severity.CRITICAL,
                     category="连续工作天数",
-                    message=f"连续工作{max_streak}天超过法定上限{self.LEGAL_MAX_CONSECUTIVE_DAYS}天",
+                    message=f"连续工作{max_streak}天（{worst_start}至{worst_end}），超过法定上限{self.LEGAL_MAX_CONSECUTIVE_DAYS}天",
                     employee_id=emp_id,
                     employee_name=emp_name,
+                    shift_date=worst_start,
                     suggestion=f"插入休息日，确保任意{self.LEGAL_MAX_CONSECUTIVE_DAYS + 1}天内至少休息1天",
+                    details={"streak": max_streak, "start": str(worst_start), "end": str(worst_end)},
                 ))
-            elif max_streak == self.LEGAL_MAX_CONSECUTIVE_DAYS:
+            elif max_streak == self.WARN_CONSECUTIVE_DAYS:
                 violations.append(Violation(
                     severity=Severity.WARNING,
                     category="连续工作天数预警",
-                    message=f"连续工作已达{max_streak}天上限",
+                    message=f"连续工作已达{max_streak}天（{worst_start}至{worst_end}），触碰法定上限边界",
                     employee_id=emp_id,
                     employee_name=emp_name,
-                    suggestion="后续务必安排休息，避免超时",
+                    shift_date=worst_start,
+                    suggestion="后续务必安排休息，避免超时；建议当日减少工作量",
+                    details={"streak": max_streak, "start": str(worst_start), "end": str(worst_end)},
+                ))
+
+        for emp_id, dates in per_emp_work_dates.items():
+            emp = self._get_employee(emp_id)
+            emp_name = emp.name if emp else emp_id
+            hist_dates = history_weekend_dates.get(emp_id, [])
+            wknds_with_work = self._find_consecutive_weekends(list(dates), week_start, hist_dates)
+            if wknds_with_work:
+                n_weeks = len(wknds_with_work)
+                first = wknds_with_work[0][0]
+                last = wknds_with_work[-1][1]
+                desc = "、".join(
+                    f"{r[0].strftime('%m/%d')}~{r[1].strftime('%m/%d')}" for r in wknds_with_work
+                )
+                violations.append(Violation(
+                    severity=Severity.INFO,
+                    category="连续周末排班",
+                    message=f"已连续{n_weeks}个周末被安排上班（{desc}），达到提醒阈值",
+                    employee_id=emp_id,
+                    employee_name=emp_name,
+                    shift_date=last,
+                    suggestion=f"建议在后续周末安排休息，已连续{n_weeks}次，下一个周末优先考虑轮空",
+                    details={"weekends": [(str(a), str(b)) for a, b in wknds_with_work], "streak_weeks": n_weeks},
                 ))
 
         if week_start:
@@ -309,20 +399,24 @@ class ShiftValidator:
                 counts = [c for _, c in weekend_counts]
                 avg = sum(counts) / len(counts) if counts else 0
                 for emp_id, cnt in weekend_counts:
-                    if cnt >= self.WARN_CONSECUTIVE_WEEKENDS and cnt > avg + 1:
+                    if cnt >= 3 and cnt > avg + 0.5:
                         emp = self._get_employee(emp_id)
                         emp_name = emp.name if emp else emp_id
                         violations.append(Violation(
                             severity=Severity.INFO,
                             category="周末班公平性",
-                            message=f"该员工本周承担{cnt}个周末班次，明显高于平均（{avg:.1f}）",
+                            message=f"该员工本周承担{cnt}个周末班次，高于平均（{avg:.1f}）",
                             employee_id=emp_id,
                             employee_name=emp_name,
-                            suggestion="下周优先安排其他员工轮替周末班",
+                            suggestion="下周优先安排其他员工轮替周末班，注意公平分配",
                         ))
 
         severity_order = {Severity.CRITICAL: 0, Severity.WARNING: 1, Severity.INFO: 2}
-        violations.sort(key=lambda v: (severity_order.get(v.severity, 99), v.employee_id or "", v.shift_date or date.min))
+        violations.sort(key=lambda v: (
+            severity_order.get(v.severity, 99),
+            v.employee_id or "",
+            v.shift_date or Date.min,
+        ))
 
         critical = sum(1 for v in violations if v.severity == Severity.CRITICAL)
         warning = sum(1 for v in violations if v.severity == Severity.WARNING)
@@ -396,16 +490,22 @@ class ShiftValidator:
             table_data = [["级别", "分类", "员工", "日期", "问题描述", "修正建议"]]
             for v in report.violations:
                 label = {"critical": "严重", "warning": "警告", "info": "建议"}.get(v.severity.value, v.severity.value)
+                extra_msg = v.message
+                if "weekends" in v.details and v.details["weekends"]:
+                    wknds = ", ".join(
+                        f"{a[5:]}~{b[5:]}" for a, b in v.details["weekends"]
+                    )
+                    extra_msg = f"{v.message} [涉及周末: {wknds}]"
                 table_data.append([
                     label,
                     v.category,
                     f"{v.employee_name or '-'}\n({v.employee_id or '-'})",
                     str(v.shift_date) if v.shift_date else "-",
-                    v.message,
+                    extra_msg,
                     v.suggestion,
                 ])
 
-            col_widths = [20*mm, 30*mm, 30*mm, 22*mm, 55*mm, 45*mm]
+            col_widths = [20 * mm, 30 * mm, 30 * mm, 22 * mm, 55 * mm, 45 * mm]
             table = Table(table_data, colWidths=col_widths, repeatRows=1)
             severity_colors = {
                 "严重": colors.hex2color("#ffcccc"),
